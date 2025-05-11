@@ -1,10 +1,12 @@
 package io.quarkiverse.antorassured;
 
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -58,8 +60,17 @@ public class LinkStream {
     }
 
     static LinkGroup createDefaultGroup() {
-        return new LinkGroup(null, Pattern.compile(".*"), RateLimit.none(),
-                Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), new LinkGroupStats());
+        return new LinkGroup(
+                null,
+                Pattern.compile(".*"),
+                Function.identity(),
+                Collections.emptyMap(),
+                RateLimit.none(),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                new LinkGroupStats(),
+                FragmentValidator.defaultFragmentValidator());
     }
 
     /**
@@ -232,11 +243,14 @@ public class LinkStream {
         return new LinkGroup(
                 this,
                 Pattern.compile(regExp),
+                Function.identity(),
+                Collections.emptyMap(),
                 RateLimit.none(),
                 Collections.emptyList(),
                 Collections.emptyList(),
                 Collections.emptyList(),
-                new LinkGroupStats());
+                new LinkGroupStats(),
+                FragmentValidator.defaultFragmentValidator());
     }
 
     /**
@@ -346,7 +360,7 @@ public class LinkStream {
     ValidationRequest createRequest(Link link) {
         for (LinkGroup group : groups) {
             if (group.pattern.matcher(link.resolvedUri()).matches()) {
-                return new ValidationRequest(link, retryAttempts + 1, group);
+                return new ValidationRequest(group.linkMapper.apply(link), retryAttempts + 1, group);
             }
         }
         return new ValidationRequest(link, retryAttempts + 1, groups.get(groups.size() - 1));
@@ -393,22 +407,31 @@ public class LinkStream {
         final List<AggregatePolicy> continuationPolicies;
         private final List<AggregatePolicy> finalPolicies;
         private final LinkGroupStats stats;
+        private final Map<String, List<String>> headers;
+        private final Function<Link, Link> linkMapper;
+        private final FragmentValidator fragmentValidator;
 
         private LinkGroup(
                 LinkStream parent,
                 Pattern pattern,
+                Function<Link, Link> linkMapper,
+                Map<String, List<String>> headers,
                 RateLimit rateLimit,
                 List<Function<Stream<Link>, Stream<Link>>> streamTransformers,
                 List<AggregatePolicy> continuationPolicies,
                 List<AggregatePolicy> finalPolicies,
-                LinkGroupStats stats) {
+                LinkGroupStats stats,
+                FragmentValidator fragmentValidator) {
             this.parent = parent;
             this.pattern = pattern;
+            this.linkMapper = linkMapper;
+            this.headers = headers;
             this.rateLimit = rateLimit;
             this.streamTransformers = streamTransformers;
             this.continuationPolicies = continuationPolicies;
             this.finalPolicies = finalPolicies;
             this.stats = stats;
+            this.fragmentValidator = fragmentValidator;
         }
 
         /**
@@ -421,11 +444,14 @@ public class LinkStream {
             return new LinkGroup(
                     parent,
                     pattern,
+                    linkMapper,
+                    headers,
                     rateLimit,
                     streamTransformers,
                     continuationPolicies,
                     finalPolicies,
-                    stats);
+                    stats,
+                    fragmentValidator);
         }
 
         /**
@@ -440,6 +466,8 @@ public class LinkStream {
             return new LinkGroup(
                     parent,
                     pattern,
+                    linkMapper,
+                    headers,
                     rateLimit,
                     copyAndAdd(
                             streamTransformers,
@@ -462,7 +490,8 @@ public class LinkStream {
                             }),
                     continuationPolicies,
                     finalPolicies,
-                    stats);
+                    stats,
+                    fragmentValidator);
         }
 
         /**
@@ -479,11 +508,14 @@ public class LinkStream {
             return new LinkGroup(
                     parent,
                     pattern,
+                    linkMapper,
+                    headers,
                     rateLimit,
                     streamTransformers,
                     copyAndAdd(continuationPolicies, assertion),
                     finalPolicies,
-                    stats);
+                    stats,
+                    fragmentValidator);
         }
 
         /**
@@ -502,11 +534,121 @@ public class LinkStream {
             return new LinkGroup(
                     parent,
                     pattern,
+                    linkMapper,
+                    headers,
                     rateLimit,
                     streamTransformers,
                     continuationPolicies,
                     copyAndAdd(finalPolicies, policy),
-                    stats);
+                    stats,
+                    fragmentValidator);
+        }
+
+        /**
+         * Set Basic Authorization header.
+         *
+         * @param username
+         * @param password
+         * @return a new {@link LinkGroup}
+         *
+         * @since 2.0.0
+         */
+        public LinkGroup basicAuth(String username, String password) {
+            return header("Authorization",
+                    "Basic " + Base64.getEncoder().encodeToString((username + ":" + password).getBytes()));
+        }
+
+        /**
+         * Set Bearer Authorization header using the given {@code token}.
+         *
+         * @param token
+         * @return a new {@link LinkGroup}
+         *
+         * @since 2.0.0
+         */
+        public LinkGroup bearerToken(String token) {
+            return header("Authorization", "Bearer " + token);
+        }
+
+        /**
+         * Add the given HTTP header to all requests targeting this {@link LinkGroup}.
+         *
+         * @param key the HTTP header name
+         * @param value the HTTP header value
+         * @return a new {@link LinkGroup}
+         *
+         * @since 2.0.0
+         */
+        public LinkGroup header(String key, String value) {
+            final Map<String, List<String>> newHeaders = new LinkedHashMap<>(headers);
+            newHeaders.compute(key, (k, v) -> {
+                if (v == null) {
+                    return Collections.singletonList(value);
+                } else {
+                    v = new ArrayList<>(v);
+                    v.add(value);
+                    return Collections.unmodifiableList(v);
+                }
+            });
+            return new LinkGroup(
+                    parent,
+                    pattern,
+                    linkMapper,
+                    newHeaders,
+                    rateLimit,
+                    streamTransformers,
+                    continuationPolicies,
+                    finalPolicies,
+                    stats,
+                    fragmentValidator);
+        }
+
+        public Map<String, List<String>> headers() {
+            return headers;
+        }
+
+        /**
+         * Switch the original link to something else.
+         * <p>
+         * This is useful e.g. in case of some {@code http://github.com} links that are rate limited,
+         * but once they are mapped to {@code http://api.github.com} and accessed with a {@link #bearerToken(String)}
+         * then the limits are much higher and the result is equivalent.
+         *
+         * @param token
+         * @return a new {@link LinkGroup}
+         *
+         * @since 2.0.0
+         */
+        public LinkGroup linkMapper(Function<Link, Link> linkMapper) {
+            return new LinkGroup(
+                    parent,
+                    pattern,
+                    linkMapper,
+                    headers,
+                    rateLimit,
+                    streamTransformers,
+                    continuationPolicies,
+                    finalPolicies,
+                    stats,
+                    fragmentValidator);
+        }
+
+        public LinkGroup fragmentValidator(FragmentValidator fragmentValidator) {
+            return new LinkGroup(
+                    parent,
+                    pattern,
+                    linkMapper,
+                    headers,
+                    rateLimit,
+                    streamTransformers,
+                    continuationPolicies,
+                    finalPolicies,
+                    stats,
+                    fragmentValidator);
+        }
+
+        public FragmentValidator fragmentValidator() {
+            return fragmentValidator;
         }
 
         /**

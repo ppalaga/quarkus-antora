@@ -4,15 +4,18 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.assertj.core.api.Assertions;
+import org.assertj.core.api.Assumptions;
 import org.assertj.core.api.ListAssert;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.AfterAll;
@@ -21,6 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import io.restassured.RestAssured;
 import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.ext.web.Router;
@@ -30,6 +34,10 @@ import io.vertx.ext.web.handler.BodyHandler;
 public class LinkStreamTest {
     private static final Logger log = Logger.getLogger(LinkStreamTest.class);
     private static HttpServer server;
+
+    private static final String USERNAME = "joe";
+    private static final String PASSWORD = "secret1234";
+    private static final String TOKEN = "deadbeef";
 
     @Test
     void retry() {
@@ -254,6 +262,151 @@ public class LinkStreamTest {
 
     }
 
+    @Test
+    void basicAuth() {
+        RestAssured.delete("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(201);
+
+        Assertions.assertThat(
+                links(
+                        "http://localhost:8084/basicAuth/valid",
+                        "http://localhost:8084/basicAuth/anonymous",
+                        "http://localhost:8084/basicAuth/invalid")
+
+                        .group("http://localhost:8084/basicAuth/valid")
+                        .basicAuth(USERNAME, PASSWORD)
+                        .endGroup()
+
+                        .group("http://localhost:8084/basicAuth/invalid")
+                        .basicAuth(USERNAME, "bad")
+                        .endGroup()
+
+                        .validate()
+                        .stream()
+                        .map(ValidationResult::toString))
+                .containsExactlyInAnyOrder(
+                        "http://localhost:8084/basicAuth/anonymous: 401 Unauthorized, attempted 1 times",
+                        "http://localhost:8084/basicAuth/invalid: 401 Unauthorized, attempted 1 times");
+
+        List<String> accessLog = Arrays.asList(RestAssured.get("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(200)
+                .extract().body().asString().split(","));
+
+        Assertions.assertThat(accessLog)
+                .containsExactlyInAnyOrder(
+                        "/basicAuth/valid 200",
+                        "/basicAuth/anonymous 401",
+                        "/basicAuth/invalid 401");
+
+    }
+
+    @Test
+    void bearerToken() {
+        RestAssured.delete("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(201);
+
+        Assertions.assertThat(
+                links(
+                        "http://localhost:8084/bearerToken/valid",
+                        "http://localhost:8084/bearerToken/anonymous",
+                        "http://localhost:8084/bearerToken/invalid")
+
+                        .group("http://localhost:8084/bearerToken/valid")
+                        .bearerToken(TOKEN)
+                        .endGroup()
+
+                        .group("http://localhost:8084/bearerToken/invalid")
+                        .bearerToken("bad")
+                        .endGroup()
+
+                        .validate()
+                        .stream()
+                        .map(ValidationResult::toString))
+                .containsExactlyInAnyOrder(
+                        "http://localhost:8084/bearerToken/anonymous: 401 Unauthorized, attempted 1 times",
+                        "http://localhost:8084/bearerToken/invalid: 401 Unauthorized, attempted 1 times");
+
+        List<String> accessLog = Arrays.asList(RestAssured.get("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(200)
+                .extract().body().asString().split(","));
+
+        Assertions.assertThat(accessLog)
+                .containsExactlyInAnyOrder(
+                        "/bearerToken/valid 200",
+                        "/bearerToken/anonymous 401",
+                        "/bearerToken/invalid 401");
+
+    }
+
+    @Test
+    void gitHubBearerToken() {
+
+        final String ghToken = ""; //System.getenv("GITHUB_TOKEN");
+
+        Assumptions.assumeThat(ghToken).isNotBlank();
+
+        Assertions.assertThat(
+                links(
+                        "https://github.com/quarkiverse/quarkus-cxf/blob/main/integration-tests/ws-trust/src/main/resources/application.properties#L5-L6",
+                        "https://github.com/quarkiverse/quarkus-cxf/blob/main/integration-tests/ws-trust/src/main/resources/application.properties#L7",
+                        "https://github.com/quarkiverse/quarkus-cxf/blob/main/integration-tests/ws-trust/src/main/resources/asymmetric-saml2-policy.xml")
+
+                        .group("https://github.com/[^/]+/[^/]+/blob/.*")
+                        .bearerToken(ghToken)
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                        .linkMapper(link ->
+                            link.mapToUri(
+                                    Pattern.compile("https://github.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)")
+                                    .matcher(link.resolvedUri()).replaceAll("https://api.github.com/repos/$1/$2/contents/$4?ref=$3")))
+                        .fragmentValidator(FragmentValidator.githubBlobFragmentValidator())
+                        .endGroup()
+
+                        .validate()
+                        .stream())
+                .isEmpty();
+
+    }
+
+    @Test
+    void linkMapper() {
+        RestAssured.delete("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(201);
+
+        Assertions.assertThat(
+                links(
+                        "http://localhost:8084/rateLimit/1/50/0",
+                        "http://localhost:8084/rateLimit/1/50/1",
+                        "http://localhost:8084/rateLimit/1/50/2",
+                        "http://localhost:8084/rateLimit/1/50/3")
+
+                        .group("http://localhost:8084/rateLimit/1/50/.*")
+                        .linkMapper(link -> link.mapToUri(link.resolvedUri().replace("http://localhost:8084/rateLimit/1/50/",
+                                "http://localhost:8084/constant/200/")))
+                        .endGroup()
+
+                        .validate()
+                        .stream())
+                .isEmpty();
+
+        List<String> accessLog = Arrays.asList(RestAssured.get("http://localhost:8084/accessLog")
+                .then()
+                .statusCode(200)
+                .extract().body().asString().split(","));
+
+        Assertions.assertThat(accessLog)
+                .containsExactlyInAnyOrder(
+                        "/constant/200/0 200",
+                        "/constant/200/1 200",
+                        "/constant/200/2 200",
+                        "/constant/200/3 200");
+
+    }
+
     @BeforeAll
     static void beforeAll() {
         final Vertx vertx = Vertx.vertx();
@@ -311,6 +464,47 @@ public class LinkStreamTest {
 
         router.get("/constant/:status/:retryAfter").handler(context -> {
             final int statusCode = Integer.parseInt(context.pathParam("status"));
+            accessLogger.accept(context, statusCode);
+            context.response()
+                    .setStatusCode(statusCode)
+                    .putHeader("Retry-After", context.pathParam("retryAfter"))
+                    .end("");
+        });
+
+        router.get("/basicAuth/:random").handler(context -> {
+            final String authHeader = context.request().getHeader(HttpHeaders.AUTHORIZATION);
+            final int statusCode;
+            if (authHeader == null || !authHeader.startsWith("Basic ")) {
+                statusCode = 401;
+            } else {
+                String base64Credentials = authHeader.substring("Basic ".length()).trim();
+                String[] parts = new String(Base64.getDecoder().decode(base64Credentials)).split(":", 2);
+                if (parts.length == 2 && USERNAME.equals(parts[0]) && PASSWORD.equals(parts[1])) {
+                    statusCode = 200;
+                } else {
+                    statusCode = 401;
+                }
+            }
+            accessLogger.accept(context, statusCode);
+            context.response()
+                    .setStatusCode(statusCode)
+                    .putHeader("Retry-After", context.pathParam("retryAfter"))
+                    .end("");
+        });
+
+        router.get("/bearerToken/:random").handler(context -> {
+            final String authHeader = context.request().getHeader(HttpHeaders.AUTHORIZATION);
+            final int statusCode;
+            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                statusCode = 401;
+            } else {
+                String token = authHeader.substring("Bearer ".length()).trim();
+                if (TOKEN.equals(token)) {
+                    statusCode = 200;
+                } else {
+                    statusCode = 401;
+                }
+            }
             accessLogger.accept(context, statusCode);
             context.response()
                     .setStatusCode(statusCode)
